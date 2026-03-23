@@ -1,115 +1,177 @@
 """
 Model Optimizer Module
-Handles ONNX model optimization including simplification and quantization
+Handles ONNX model optimization including graph simplification and quantization.
+
+Optimization techniques provided:
+  1. Graph simplification  – onnx-simplifier (folds constants, removes dead nodes)
+  2. Dynamic quantization  – INT8 weights, activations quantized at runtime (CPU)
+  3. FP16 conversion       – halves model size, ideal for GPU inference
+  4. ORT graph optimization – SessionOptions.ORT_ENABLE_ALL applied when loading
 """
 
+from __future__ import annotations
+
+import logging
 import os
-import onnx
-from onnxsim import simplify
-import onnxruntime as ort
-from onnxruntime.quantization import quantize_dynamic, QuantType
+from pathlib import Path
 from typing import Optional
+
+import onnx
+import onnxruntime as ort
+from onnxruntime.quantization import QuantType, quantize_dynamic
+from onnxsim import simplify
+
+logger = logging.getLogger(__name__)
 
 
 class ModelOptimizer:
-    """Optimize ONNX models using various techniques."""
-    
+    """Optimize ONNX models using various compression and precision techniques."""
+
     def __init__(self, onnx_model_path: str):
         """
-        Initialize model optimizer.
-        
+        Initialize the optimizer.
+
         Args:
-            onnx_model_path: Path to ONNX model
+            onnx_model_path: Path to the source ONNX model.
         """
         self.onnx_model_path = onnx_model_path
-        self.model_dir = os.path.dirname(onnx_model_path)
-        self.model_name = os.path.splitext(os.path.basename(onnx_model_path))[0]
-        
+        self._model_dir = Path(onnx_model_path).parent
+        self._stem = Path(onnx_model_path).stem
+
+    # ------------------------------------------------------------------
+    # Internal helpers
+    # ------------------------------------------------------------------
+
+    def _default_output(self, suffix: str) -> str:
+        return str(self._model_dir / f"{self._stem}{suffix}.onnx")
+
+    @staticmethod
+    def _make_session_options(opt_level: ort.GraphOptimizationLevel = ort.GraphOptimizationLevel.ORT_ENABLE_ALL) -> ort.SessionOptions:
+        """
+        Build an ORT SessionOptions with a chosen graph optimization level.
+
+        ORT_ENABLE_ALL (level 99) activates:
+          - Basic optimisations (node fusions, constant folding)
+          - Extended optimisations (layout optimisation, memory reuse)
+          - Execution-provider–specific optimisations
+        """
+        opts = ort.SessionOptions()
+        opts.graph_optimization_level = opt_level
+        return opts
+
+    # ------------------------------------------------------------------
+    # Optimization methods
+    # ------------------------------------------------------------------
+
     def simplify(self, output_path: Optional[str] = None) -> str:
         """
-        Simplify ONNX model structure using onnx-simplifier.
-        
+        Simplify ONNX graph structure using onnx-simplifier.
+
+        Removes redundant nodes, folds constants, and canonicalises the graph
+        to help downstream tools (quantizers, ORT) work more efficiently.
+
         Args:
-            output_path: Path to save simplified model
-            
+            output_path: Destination path; defaults to ``<stem>_simplified.onnx``.
+
         Returns:
-            Path to simplified model
+            Path to the simplified model.
         """
-        if output_path is None:
-            output_path = os.path.join(self.model_dir, f"{self.model_name}_simplified.onnx")
-        
-        # Load and simplify model
+        output_path = output_path or self._default_output("_simplified")
         model = onnx.load(self.onnx_model_path)
         model_simp, check = simplify(model)
-        
         if not check:
-            print("⚠️  Simplified model validation failed, but saving anyway...")
-        
-        # Save simplified model
+            logger.warning("onnx-simplifier validation failed; saving output anyway.")
         onnx.save(model_simp, output_path)
-        print(f"✅ Model simplified and saved to: {output_path}")
-        
+        logger.info("Graph simplified → %s", output_path)
         return output_path
-    
+
     def dynamic_quantize(self, output_path: Optional[str] = None) -> str:
         """
-        Apply dynamic quantization to ONNX model.
-        
+        Apply dynamic INT8 quantization (weights only, CPU-friendly).
+
+        Weight tensors are pre-quantized to QUInt8; activations are quantized
+        on-the-fly during inference.  Typically yields ~4× size reduction with
+        minimal accuracy loss on NLP/vision models.
+
         Args:
-            output_path: Path to save quantized model
-            
+            output_path: Destination path; defaults to ``<stem>_dynamic_quant.onnx``.
+
         Returns:
-            Path to quantized model
+            Path to the quantized model.
         """
-        if output_path is None:
-            output_path = os.path.join(self.model_dir, f"{self.model_name}_dynamic_quant.onnx")
-        
-        # Apply dynamic quantization
+        output_path = output_path or self._default_output("_dynamic_quant")
         quantize_dynamic(
             self.onnx_model_path,
             output_path,
-            weight_type=QuantType.QUInt8
+            weight_type=QuantType.QUInt8,
         )
-        
-        print(f"✅ Dynamic quantization applied and saved to: {output_path}")
+        logger.info("Dynamic INT8 quantization → %s", output_path)
         return output_path
-    
+
     def fp16_quantize(self, output_path: Optional[str] = None) -> str:
         """
-        Convert model to float16 precision.
-        
+        Convert model weights and activations to float16.
+
+        Halves model file size and memory footprint; best suited for CUDA
+        devices that have native FP16 tensor-core support.
+
         Args:
-            output_path: Path to save FP16 model
-            
+            output_path: Destination path; defaults to ``<stem>_fp16.onnx``.
+
         Returns:
-            Path to FP16 model
+            Path to the FP16 model.
+
+        Raises:
+            ImportError: If ``onnxconverter-common`` is not installed.
         """
-        if output_path is None:
-            output_path = os.path.join(self.model_dir, f"{self.model_name}_fp16.onnx")
-        
-        # Load model
+        try:
+            from onnxconverter_common import float16
+        except ImportError as exc:
+            raise ImportError(
+                "FP16 conversion requires 'onnxconverter-common'. "
+                "Install it with: pip install onnxconverter-common"
+            ) from exc
+
+        output_path = output_path or self._default_output("_fp16")
         model = onnx.load(self.onnx_model_path)
-        
-        # Convert to FP16
-        from onnxconverter_common import float16
         model_fp16 = float16.convert_float_to_float16(model)
-        
-        # Save FP16 model
         onnx.save(model_fp16, output_path)
-        print(f"✅ FP16 conversion completed and saved to: {output_path}")
-        
+        logger.info("FP16 conversion → %s", output_path)
         return output_path
-    
-    def get_model_size(self, model_path: str) -> float:
+
+    def create_optimized_session(
+        self,
+        model_path: Optional[str] = None,
+        providers: Optional[list[str]] = None,
+    ) -> ort.InferenceSession:
         """
-        Get model file size in MB.
-        
+        Create an ORT InferenceSession with full graph optimization enabled.
+
+        Using ``ORT_ENABLE_ALL`` lets ORT apply operator fusions (e.g. LayerNorm,
+        Attention), memory layout transformations, and EP-specific kernels at
+        session-creation time—no extra file needed.
+
         Args:
-            model_path: Path to model file
-            
+            model_path: Path to ONNX model; defaults to the source model.
+            providers: ORT execution providers; defaults to CPU only.
+
         Returns:
-            File size in MB
+            An optimized ``ort.InferenceSession``.
         """
-        size_bytes = os.path.getsize(model_path)
-        size_mb = size_bytes / (1024 * 1024)
-        return size_mb
+        path = model_path or self.onnx_model_path
+        providers = providers or ["CPUExecutionProvider"]
+        opts = self._make_session_options()
+        session = ort.InferenceSession(path, sess_options=opts, providers=providers)
+        logger.info(
+            "ORT session created with ORT_ENABLE_ALL optimization (model: %s)", path
+        )
+        return session
+
+    # ------------------------------------------------------------------
+    # Utility
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def get_model_size(model_path: str) -> float:
+        """Return model file size in megabytes."""
+        return os.path.getsize(model_path) / (1024 * 1024)
