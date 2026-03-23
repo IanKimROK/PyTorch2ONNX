@@ -1,89 +1,123 @@
 # PyTorch to ONNX Model Conversion and Optimization Pipeline
 
-A comprehensive pipeline for converting PyTorch models to ONNX format with various optimization techniques including quantization and performance benchmarking.
+A comprehensive pipeline for converting PyTorch models to ONNX format with various optimization and compression techniques.
 
 ## Features
 
-- ✅ PyTorch to ONNX conversion with dynamic batch size support
-- ✅ Model optimization using `onnx-simplifier`
-- ✅ Dynamic and Float16 quantization
-- ✅ Performance benchmarking (inference time, accuracy, file size)
-- ✅ GPU/CPU inference comparison
-- ✅ Support for both dummy and real image inputs (CIFAR-10, ImageNet)
-- ✅ Modular design for easy integration
+- PyTorch → ONNX conversion with dynamic batch size support
+- **Dynamo export** – `torch.onnx.export(dynamo=True)` for full graph capture (PyTorch 2.1+)
+- Model graph simplification via `onnx-simplifier`
+- Dynamic INT8 quantization and FP16 conversion
+- **ORT graph optimization** – `ORT_ENABLE_ALL` applied automatically on every session
+- Performance benchmarking (inference time, file size, MSE, cosine similarity)
+- GPU / CPU inference comparison
+- `ConversionConfig` dataclass for type-safe, IDE-friendly configuration
+- Modular design (`src/`) with a thin standalone entry-point (`run_complete_pipeline.py`)
+- Pytest test suite (offline – no weight downloads required)
 
 ## Installation
 
-### Basic Installation
 ```bash
 pip install -r requirements.txt
 ```
 
-### Additional Dependencies
-```bash
-# For FP16 conversion support
-pip install onnxconverter-common
-
-# For GPU support (choose based on your CUDA version)
-pip install onnxruntime-gpu
-```
-
-### Install from Source
-```bash
-git clone https://github.com/yourusername/pytorch-onnx-pipeline.git
-cd pytorch-onnx-pipeline
-pip install -e .
-```
+> **GPU support**: `onnxruntime` and `onnxruntime-gpu` cannot be installed simultaneously.
+> For CUDA inference, uninstall `onnxruntime` first, then:
+> ```bash
+> pip uninstall onnxruntime
+> pip install onnxruntime-gpu          # picks the right version for your CUDA
+> ```
 
 ## Quick Start
 
-### Option 1: Run Complete Pipeline (Recommended)
+### Option 1: Standalone script
+
 ```bash
-# Run with default settings (ResNet18)
-python examples/run_pipeline.py
+# Default – ResNet18, CPU, opset 17
+python run_complete_pipeline.py
 
-# Run with custom model and options
-python examples/run_pipeline.py --model resnet50 --device cuda --test-real-images --test-dynamic-batch
+# ResNet50 on GPU with Dynamo exporter
+python run_complete_pipeline.py --model resnet50 --device cuda --dynamo
 
-# Available options:
-# --model: Model name (resnet18, resnet50, vgg16, mobilenet_v2, etc.)
-# --input-size: Input image size (default: 224)
-# --device: cpu or cuda
-# --num-runs: Number of benchmark runs (default: 100)
-# --test-real-images: Test with CIFAR-10 images
-# --test-dynamic-batch: Test dynamic batch sizes
-```
-
-### Option 2: Use Standalone Script
-```bash
-# Install dependencies first
+# Install / verify all dependencies
 python run_complete_pipeline.py --install
-
-# Run the pipeline
-python run_complete_pipeline.py --model resnet18 --device cuda
 ```
 
-### Option 3: Use as Python Module
+### Option 2: Modular example
+
+```bash
+python examples/run_pipeline.py --model mobilenet_v3_small --device cuda \
+    --dynamo --opset 17 --num-runs 200 --test-dynamic-batch
+```
+
+**All CLI flags:**
+
+| Flag | Default | Description |
+|---|---|---|
+| `--model` | `resnet18` | Any `torchvision.models` name |
+| `--input-size` | `224` | Square input image side length |
+| `--output-dir` | `models` | Directory for saved ONNX files |
+| `--device` | `cpu` | `cpu` or `cuda` |
+| `--num-runs` | `100` | Timed inference iterations |
+| `--num-warmup` | `10` | Warmup iterations before timing |
+| `--opset` | `17` | ONNX opset version |
+| `--dynamo` | off | Use `torch.onnx.export(dynamo=True)` |
+| `--test-real-images` | off | Load 5 CIFAR-10 samples |
+| `--test-dynamic-batch` | off | Verify batch sizes 1 / 4 / 8 / 16 |
+
+### Option 3: Python API
+
 ```python
-from src import ModelConverter, ModelOptimizer, Benchmark
+from src import ConversionConfig, ModelConverter, ModelOptimizer, Benchmark
 
-# Step 1: Convert PyTorch to ONNX
-converter = ModelConverter(model_name='resnet18')
-onnx_path = converter.convert_to_onnx('models/resnet18.onnx')
+# --- Step 1: Configure and convert ---
+config = ConversionConfig(
+    model_name="resnet50",
+    input_shape=(1, 3, 224, 224),
+    pretrained=True,
+    opset_version=17,
+    use_dynamo=False,         # set True for PyTorch 2.1+ dynamo path
+)
+converter = ModelConverter(config=config)
+onnx_path = converter.convert_to_onnx("models/resnet50.onnx")
 
-# Step 2: Optimize the model
+# --- Step 2: Optimise ---
 optimizer = ModelOptimizer(onnx_path)
-simplified_path = optimizer.simplify()
-dynamic_quant_path = optimizer.dynamic_quantize()
-fp16_path = optimizer.fp16_quantize()
+simplified_path   = optimizer.simplify()
+int8_path         = optimizer.dynamic_quantize()
+fp16_path         = optimizer.fp16_quantize()   # requires onnxconverter-common
 
-# Step 3: Benchmark all models
-benchmark = Benchmark(device='cuda')  # or 'cpu'
+# Optionally get an ORT session with ORT_ENABLE_ALL graph optimization
+session = optimizer.create_optimized_session()
+
+# --- Step 3: Benchmark ---
+benchmark = Benchmark(device="cpu", num_warmup=10)
 results = benchmark.compare_all_models(
     pytorch_model=converter.pytorch_model,
     onnx_path=onnx_path,
-    optimized_paths=[simplified_path, dynamic_quant_path, fp16_path]
+    optimized_paths=[simplified_path, int8_path, fp16_path],
 )
+```
+
+### Custom model
+
+Pass your own `torch.nn.Module` directly – no torchvision dependency required:
+
+```python
+import torch, torch.nn as nn
+from src.model_converter import ConversionConfig, ModelConverter
+
+class MyModel(nn.Module):
+    def forward(self, x):
+        return x.mean(dim=[2, 3])
+
+# Bypass the torchvision loader by setting pytorch_model manually
+config = ConversionConfig(input_shape=(1, 3, 224, 224), pretrained=False)
+converter = ModelConverter.__new__(ModelConverter)
+converter.config = config
+converter.pytorch_model = MyModel().eval()
+
+converter.convert_to_onnx("models/my_model.onnx")
 ```
 
 ## Project Structure
@@ -92,190 +126,83 @@ results = benchmark.compare_all_models(
 PyTorch2ONNX/
 ├── README.md
 ├── requirements.txt
-├── run_complete_pipeline.py    # Standalone script with all features
+├── pyproject.toml                  # pytest configuration
+├── run_complete_pipeline.py        # standalone entry-point
 ├── src/
-│   ├── __init__.py
-│   ├── model_converter.py      # PyTorch to ONNX conversion
-│   ├── model_optimizer.py      # ONNX optimization (simplify, quantize)
-│   ├── benchmark.py            # Performance benchmarking
-│   └── utils.py                # Helper utilities
+│   ├── __init__.py                 # exports ConversionConfig + all public classes
+│   ├── model_converter.py          # ConversionConfig dataclass + ModelConverter
+│   ├── model_optimizer.py          # simplify / INT8 / FP16 / ORT session
+│   ├── benchmark.py                # latency, file size, MSE, cosine similarity
+│   └── utils.py                    # ImageLoader, check_gpu_availability
 ├── examples/
-│   └── run_pipeline.py         # Example usage script
-├── models/                     # Output directory for converted models
-└── data/                       # Dataset cache directory
+│   └── run_pipeline.py             # full pipeline with all CLI flags
+├── tests/
+│   ├── conftest.py                 # shared fixtures (TinyModel, no downloads)
+│   ├── test_converter.py
+│   ├── test_optimizer.py
+│   ├── test_benchmark.py
+│   └── test_utils.py
+├── models/                         # ONNX output files (git-ignored)
+└── data/                           # dataset cache (git-ignored)
 ```
 
 ## Supported Models
 
-All models from `torchvision.models` are supported, including:
-- ResNet family (resnet18, resnet34, resnet50, resnet101, resnet152)
-- VGG family (vgg11, vgg13, vgg16, vgg19)
-- MobileNet (mobilenet_v2, mobilenet_v3_small, mobilenet_v3_large)
-- EfficientNet (efficientnet_b0 to efficientnet_b7)
-- DenseNet (densenet121, densenet169, densenet201)
-- SqueezeNet (squeezenet1_0, squeezenet1_1)
-- ShuffleNet (shufflenet_v2_x0_5, shufflenet_v2_x1_0)
-- And more...
-
-## Output Example
+Any model in `torchvision.models` works out of the box (loaded via `get_model` /
+`get_model_weights` – the modern weights API introduced in torchvision 0.13):
 
 ```
-🚀 Starting PyTorch to ONNX Conversion Pipeline
-============================================================
-
-💻 System Information:
-PyTorch version: 2.0.1
-ONNX Runtime version: 1.16.0
-CUDA available: True
-CUDA device: NVIDIA GeForce RTX 3090
-Available providers: ['TensorrtExecutionProvider', 'CUDAExecutionProvider', 'CPUExecutionProvider']
-
-📦 Step 1: Converting PyTorch model to ONNX
---------------------------------------------------
-✅ Successfully converted resnet18 to ONNX: models/resnet18.onnx
-
-🔧 Step 2: Optimizing ONNX models
---------------------------------------------------
-✅ Model simplified and saved to: models/resnet18_simplified.onnx
-✅ Dynamic quantization applied and saved to: models/resnet18_dynamic_quant.onnx
-✅ FP16 conversion completed and saved to: models/resnet18_fp16.onnx
-
-📊 Step 3: Benchmarking all models
---------------------------------------------------
-
-📈 Model Performance Comparison
-┌─────────────────────┬──────────────┬─────────────────┬──────────────┬─────────────┐
-│ Model               │ File Size    │ Inference Time  │ MSE          │ Cosine Sim  │
-├─────────────────────┼──────────────┼─────────────────┼──────────────┼─────────────┤
-│ PyTorch (Original)  │ 44.7 MB      │ 12.5 ms        │ 0.0000       │ 1.0000      │
-│ ONNX                │ 44.7 MB      │ 8.3 ms         │ 1.2e-07      │ 0.9999      │
-│ ONNX Simplified     │ 44.6 MB      │ 8.1 ms         │ 1.2e-07      │ 0.9999      │
-│ ONNX Dynamic Quant  │ 11.2 MB      │ 6.2 ms         │ 3.4e-05      │ 0.9998      │
-│ ONNX FP16           │ 22.4 MB      │ 5.8 ms         │ 2.1e-06      │ 0.9999      │
-└─────────────────────┴──────────────┴─────────────────┴──────────────┴─────────────┘
-
-🖥️  GPU vs CPU Comparison
-CPU Inference: 8.3 ms
-GPU Inference: 2.1 ms
-GPU Speedup: 4.0x
-
-📦 Testing dynamic batch sizes
---------------------------------------------------
-✅ Batch size 1: OK
-✅ Batch size 4: OK
-✅ Batch size 8: OK
-✅ Batch size 16: OK
-
-✨ Pipeline completed successfully!
-📁 All models saved in: models/
+resnet18/34/50/101/152 · vgg11/13/16/19 · mobilenet_v2/v3_small/v3_large
+efficientnet_b0…b7 · densenet121/169/201 · squeezenet1_0/1_1
+shufflenet_v2_x0_5/x1_0 · convnext_tiny/small/base/large · swin_t/s/b …
 ```
 
-## Advanced Usage
+## Running Tests
 
-### Custom Model Integration
+```bash
+# All tests (no network required)
+pytest
 
-```python
-import torch
-import torch.nn as nn
-from src import ModelConverter
+# Specific module
+pytest tests/test_benchmark.py -v
 
-# Define your custom model
-class CustomModel(nn.Module):
-    def __init__(self):
-        super().__init__()
-        self.conv = nn.Conv2d(3, 64, 3)
-        self.fc = nn.Linear(64 * 222 * 222, 10)
-    
-    def forward(self, x):
-        x = self.conv(x)
-        x = x.view(x.size(0), -1)
-        return self.fc(x)
-
-# Create converter with custom model
-model = CustomModel()
-converter = ModelConverter.__new__(ModelConverter)
-converter.pytorch_model = model
-converter.input_shape = (1, 3, 224, 224)
-
-# Convert to ONNX
-onnx_path = converter.convert_to_onnx('models/custom_model.onnx')
+# With coverage
+pytest --cov=src --cov-report=term-missing
 ```
 
-### Batch Processing
+## Performance Tips
 
-```python
-from src import ModelConverter, Benchmark
-
-# Process multiple models
-models_to_convert = ['resnet18', 'resnet50', 'mobilenet_v2', 'efficientnet_b0']
-
-for model_name in models_to_convert:
-    print(f"\nProcessing {model_name}...")
-    
-    # Convert
-    converter = ModelConverter(model_name=model_name)
-    onnx_path = converter.convert_to_onnx(f'models/{model_name}.onnx')
-    
-    # Optimize
-    optimizer = ModelOptimizer(onnx_path)
-    optimizer.simplify()
-    optimizer.dynamic_quantize()
-    
-    # Benchmark
-    benchmark = Benchmark()
-    results = benchmark.compare_all_models(
-        pytorch_model=converter.pytorch_model,
-        onnx_path=onnx_path,
-        optimized_paths=[...]
-    )
-```
-
-### Performance Tips
-
-1. **GPU Acceleration**: Always use `--device cuda` when GPU is available for significant speedup
-2. **Batch Size**: Test with realistic batch sizes for your use case
-3. **Quantization**: Dynamic quantization provides the best size/accuracy tradeoff for most models
-4. **Simplification**: Always simplify before quantization for better results
+1. **Simplify before quantizing** – cleaner graphs yield better INT8 calibration
+2. **`ORT_ENABLE_ALL`** is applied automatically; no extra step needed
+3. **Dynamo export** (`--dynamo`) is recommended for models with complex control flow
+4. **FP16** gives the best latency/size tradeoff on CUDA devices with tensor cores
+5. **Increase `--num-warmup`** (e.g. `--num-warmup 20`) for more stable GPU timings
 
 ## Troubleshooting
 
-### Common Issues
+**CUDA not detected**
+```bash
+python -c "import torch; print(torch.cuda.is_available())"
+pip install onnxruntime-gpu   # after uninstalling onnxruntime
+```
 
-1. **CUDA/GPU not detected**
-   ```bash
-   # Check CUDA availability
-   python -c "import torch; print(torch.cuda.is_available())"
-   
-   # Install appropriate ONNX Runtime GPU version
-   pip install onnxruntime-gpu==1.16.0  # Match your CUDA version
-   ```
+**FP16 conversion fails**
+```bash
+pip install onnxconverter-common   # already in requirements.txt
+```
 
-2. **FP16 conversion fails**
-   ```bash
-   pip install onnxconverter-common
-   ```
+**Dynamo export errors**
+- Requires PyTorch ≥ 2.1; fall back to the default legacy path by omitting `--dynamo`
 
-3. **Out of memory errors**
-   - Reduce batch size
-   - Use CPU for conversion, GPU for inference
-   - Clear cache between runs
+**Out of memory**
+- Reduce batch size or run conversion on CPU, inference on GPU
 
-4. **Dynamic axes errors**
-   - Ensure your model supports variable batch sizes
-   - Some models may need fixed input sizes
-
-### Debug Mode
-
+**Enable DEBUG logging**
 ```python
-# Enable verbose logging
 import logging
 logging.basicConfig(level=logging.DEBUG)
-
-# Run with detailed output
-converter = ModelConverter(model_name='resnet18')
-torch.onnx.export(..., verbose=True)
 ```
 
 ## License
 
-This project is licensed under the MIT License - see the [LICENSE](LICENSE) file for details.
+MIT License – see [LICENSE](LICENSE) for details.
