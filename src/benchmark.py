@@ -1,241 +1,294 @@
 """
 Benchmark Module
-Handles performance benchmarking and accuracy comparison
+Measures inference latency, file size, and output accuracy for all model variants.
 """
 
+from __future__ import annotations
+
+import logging
+import os
 import time
-import torch
+from typing import Dict, List, Optional, Tuple
+
 import numpy as np
 import onnxruntime as ort
-from typing import Dict, List, Tuple, Optional
-from tabulate import tabulate
+import torch
 from scipy.spatial.distance import cosine
-import os
+from tabulate import tabulate
+
+logger = logging.getLogger(__name__)
+
+
+def _cuda_sync(enabled: bool) -> None:
+    """Synchronize CUDA device when running on GPU."""
+    if enabled:
+        torch.cuda.synchronize()
 
 
 class Benchmark:
-    """Benchmark model performance including inference time and accuracy."""
-    
-    def __init__(self, device: str = 'cpu'):
+    """Benchmark inference latency, file size, and numerical accuracy."""
+
+    def __init__(self, device: str = "cpu", num_warmup: int = 10):
         """
-        Initialize benchmark.
-        
+        Initialize the benchmark runner.
+
         Args:
-            device: Device to run benchmarks on ('cpu' or 'cuda')
+            device: ``'cpu'`` or ``'cuda'``.
+            num_warmup: Number of warmup iterations before timing starts.
+                        More warmup reduces JIT / kernel-launch variance.
         """
         self.device = device
+        self.num_warmup = num_warmup
         self.providers = self._get_providers()
-        
+        self._use_cuda = device == "cuda" and torch.cuda.is_available()
+
+    # ------------------------------------------------------------------
+    # Internal helpers
+    # ------------------------------------------------------------------
+
     def _get_providers(self) -> List[str]:
-        """Get available execution providers for ONNX Runtime."""
-        if self.device == 'cuda' and 'CUDAExecutionProvider' in ort.get_available_providers():
-            return ['CUDAExecutionProvider', 'CPUExecutionProvider']
-        return ['CPUExecutionProvider']
-    
-    def measure_pytorch_inference(self, model: torch.nn.Module, 
-                                input_tensor: torch.Tensor,
-                                num_runs: int = 100) -> Tuple[float, np.ndarray]:
+        """Return the best available ORT execution providers for this device."""
+        if (
+            self.device == "cuda"
+            and "CUDAExecutionProvider" in ort.get_available_providers()
+        ):
+            return ["CUDAExecutionProvider", "CPUExecutionProvider"]
+        return ["CPUExecutionProvider"]
+
+    @staticmethod
+    def _make_session_options() -> ort.SessionOptions:
+        """ORT session with maximum graph optimization."""
+        opts = ort.SessionOptions()
+        opts.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
+        return opts
+
+    # ------------------------------------------------------------------
+    # PyTorch inference
+    # ------------------------------------------------------------------
+
+    def measure_pytorch_inference(
+        self,
+        model: torch.nn.Module,
+        input_tensor: torch.Tensor,
+        num_runs: int = 100,
+    ) -> Tuple[float, np.ndarray]:
         """
-        Measure PyTorch model inference time.
-        
+        Measure PyTorch model inference latency.
+
         Args:
-            model: PyTorch model
-            input_tensor: Input tensor
-            num_runs: Number of inference runs for averaging
-            
+            model: PyTorch model (will be moved to ``self.device``).
+            input_tensor: Input tensor (batch dimension should match benchmark intent).
+            num_runs: Number of timed iterations.
+
         Returns:
-            Tuple of (average inference time in ms, output array)
+            ``(avg_latency_ms, output_numpy)``
         """
         model.eval()
-        
-        # Move to device if CUDA
-        if self.device == 'cuda' and torch.cuda.is_available():
+        if self._use_cuda:
             model = model.cuda()
             input_tensor = input_tensor.cuda()
-        
+
         # Warmup
         with torch.no_grad():
-            _ = model(input_tensor)
-        
-        # Measure inference time
-        torch.cuda.synchronize() if self.device == 'cuda' else None
-        start_time = time.time()
-        
+            for _ in range(self.num_warmup):
+                _ = model(input_tensor)
+        _cuda_sync(self._use_cuda)
+
+        # Timed runs
+        start = time.perf_counter()
         with torch.no_grad():
             for _ in range(num_runs):
                 output = model(input_tensor)
-                torch.cuda.synchronize() if self.device == 'cuda' else None
-        
-        end_time = time.time()
-        avg_time_ms = (end_time - start_time) / num_runs * 1000
-        
-        # Get output for comparison
-        output_np = output.cpu().numpy()
-        
-        return avg_time_ms, output_np
-    
-    def measure_onnx_inference(self, onnx_path: str,
-                             input_array: np.ndarray,
-                             num_runs: int = 100) -> Tuple[float, np.ndarray]:
+                _cuda_sync(self._use_cuda)
+        elapsed_ms = (time.perf_counter() - start) / num_runs * 1000
+
+        return elapsed_ms, output.cpu().numpy()
+
+    # ------------------------------------------------------------------
+    # ONNX Runtime inference
+    # ------------------------------------------------------------------
+
+    def measure_onnx_inference(
+        self,
+        onnx_path: str,
+        input_array: np.ndarray,
+        num_runs: int = 100,
+        providers: Optional[List[str]] = None,
+    ) -> Tuple[float, np.ndarray]:
         """
-        Measure ONNX model inference time.
-        
+        Measure ONNX Runtime inference latency.
+
         Args:
-            onnx_path: Path to ONNX model
-            input_array: Input array
-            num_runs: Number of inference runs for averaging
-            
+            onnx_path: Path to the ``.onnx`` model file.
+            input_array: Input array (must match model's expected dtype/shape).
+            num_runs: Number of timed iterations.
+            providers: ORT providers; defaults to ``self.providers``.
+
         Returns:
-            Tuple of (average inference time in ms, output array)
+            ``(avg_latency_ms, output_numpy)``
         """
-        # Create ONNX Runtime session
-        session = ort.InferenceSession(onnx_path, providers=self.providers)
-        
-        # Get input name
+        providers = providers or self.providers
+        session = ort.InferenceSession(
+            onnx_path,
+            sess_options=self._make_session_options(),
+            providers=providers,
+        )
         input_name = session.get_inputs()[0].name
-        
+
         # Warmup
-        _ = session.run(None, {input_name: input_array})
-        
-        # Measure inference time
-        start_time = time.time()
-        
+        for _ in range(self.num_warmup):
+            session.run(None, {input_name: input_array})
+
+        # Timed runs
+        start = time.perf_counter()
         for _ in range(num_runs):
             output = session.run(None, {input_name: input_array})
-        
-        end_time = time.time()
-        avg_time_ms = (end_time - start_time) / num_runs * 1000
-        
-        return avg_time_ms, output[0]
-    
-    def calculate_metrics(self, output1: np.ndarray, output2: np.ndarray) -> Dict[str, float]:
+        elapsed_ms = (time.perf_counter() - start) / num_runs * 1000
+
+        return elapsed_ms, output[0]
+
+    # ------------------------------------------------------------------
+    # Metrics
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def calculate_metrics(
+        output1: np.ndarray, output2: np.ndarray
+    ) -> Dict[str, float]:
         """
-        Calculate comparison metrics between two outputs.
-        
+        Compute numerical similarity between two model outputs.
+
         Args:
-            output1: First output array
-            output2: Second output array
-            
+            output1: Reference output (e.g. PyTorch FP32).
+            output2: Candidate output (e.g. quantized ONNX).
+
         Returns:
-            Dictionary with MSE and cosine similarity
+            Dict with ``mse`` and ``cosine_similarity`` keys.
         """
-        # Flatten arrays for comparison
-        flat1 = output1.flatten()
-        flat2 = output2.flatten()
-        
-        # Calculate MSE
-        mse = np.mean((flat1 - flat2) ** 2)
-        
-        # Calculate cosine similarity
-        cos_sim = 1 - cosine(flat1, flat2)
-        
-        return {
-            'mse': mse,
-            'cosine_similarity': cos_sim
-        }
-    
-    def compare_all_models(self, pytorch_model: torch.nn.Module,
-                         onnx_path: str,
-                         optimized_paths: List[str],
-                         input_shape: Tuple[int, int, int, int] = (1, 3, 224, 224),
-                         num_runs: int = 100) -> Dict:
+        flat1 = output1.flatten().astype(np.float64)
+        flat2 = output2.flatten().astype(np.float64)
+        mse = float(np.mean((flat1 - flat2) ** 2))
+        cos_sim = float(1.0 - cosine(flat1, flat2))
+        return {"mse": mse, "cosine_similarity": cos_sim}
+
+    # ------------------------------------------------------------------
+    # Full comparison
+    # ------------------------------------------------------------------
+
+    def compare_all_models(
+        self,
+        pytorch_model: torch.nn.Module,
+        onnx_path: str,
+        optimized_paths: List[str],
+        input_shape: Tuple[int, int, int, int] = (1, 3, 224, 224),
+        num_runs: int = 100,
+    ) -> List[Dict]:
         """
-        Compare all model variants.
-        
+        Benchmark PyTorch model and all ONNX variants side-by-side.
+
         Args:
-            pytorch_model: Original PyTorch model
-            onnx_path: Path to base ONNX model
-            optimized_paths: List of paths to optimized models
-            input_shape: Input tensor shape
-            num_runs: Number of inference runs
-            
+            pytorch_model: Original PyTorch model.
+            onnx_path: Path to the base ONNX model.
+            optimized_paths: Paths to simplified / quantized / FP16 variants.
+            input_shape: Tensor shape used for all inference runs.
+            num_runs: Number of timed iterations per model.
+
         Returns:
-            Dictionary with comparison results
+            List of result dicts (one per model variant).
         """
-        results = []
-        
-        # Generate test input
         input_tensor = torch.randn(*input_shape)
         input_array = input_tensor.numpy()
-        
-        # Benchmark PyTorch model
-        print("📊 Benchmarking PyTorch model...")
-        pt_time, pt_output = self.measure_pytorch_inference(pytorch_model, input_tensor, num_runs)
-        
-        # Get PyTorch model size
-        pt_size = sum(p.numel() * p.element_size() for p in pytorch_model.parameters()) / (1024 * 1024)
-        
-        results.append({
-            'Model': 'PyTorch (Original)',
-            'File Size (MB)': f'{pt_size:.1f}',
-            'Inference Time (ms)': f'{pt_time:.1f}',
-            'MSE': '0.0000',
-            'Cosine Similarity': '1.0000'
-        })
-        
-        # Benchmark ONNX models
-        all_onnx_paths = [onnx_path] + optimized_paths
-        model_names = ['ONNX', 'ONNX Simplified', 'ONNX Dynamic Quant', 'ONNX FP16']
-        
-        for path, name in zip(all_onnx_paths, model_names[:len(all_onnx_paths)]):
+
+        results: List[Dict] = []
+
+        # --- PyTorch baseline ---
+        logger.info("Benchmarking PyTorch baseline …")
+        pt_time, pt_output = self.measure_pytorch_inference(
+            pytorch_model, input_tensor, num_runs
+        )
+        pt_size_mb = (
+            sum(p.numel() * p.element_size() for p in pytorch_model.parameters())
+            / (1024 * 1024)
+        )
+        results.append(
+            {
+                "Model": "PyTorch (Original)",
+                "File Size (MB)": f"{pt_size_mb:.1f}",
+                "Inference Time (ms)": f"{pt_time:.2f}",
+                "MSE": "0.000e+00",
+                "Cosine Similarity": "1.0000",
+            }
+        )
+
+        # --- ONNX variants ---
+        model_labels = [
+            "ONNX",
+            "ONNX Simplified",
+            "ONNX Dynamic Quant (INT8)",
+            "ONNX FP16",
+        ]
+        all_onnx_paths = [onnx_path, *optimized_paths]
+
+        for path, label in zip(all_onnx_paths, model_labels):
             if not os.path.exists(path):
+                logger.warning("Model file not found, skipping: %s", path)
                 continue
-                
-            print(f"📊 Benchmarking {name}...")
-            
-            # Get file size
-            file_size = os.path.getsize(path) / (1024 * 1024)
-            
-            # Measure inference
-            onnx_time, onnx_output = self.measure_onnx_inference(path, input_array, num_runs)
-            
-            # Calculate metrics
-            metrics = self.calculate_metrics(pt_output, onnx_output)
-            
-            results.append({
-                'Model': name,
-                'File Size (MB)': f'{file_size:.1f}',
-                'Inference Time (ms)': f'{onnx_time:.1f}',
-                'MSE': f'{metrics["mse"]:.2e}',
-                'Cosine Similarity': f'{metrics["cosine_similarity"]:.4f}'
-            })
-        
-        # Print results table
-        print("\n📈 Model Performance Comparison")
-        print(tabulate(results, headers='keys', tablefmt='grid'))
-        
-        # GPU vs CPU comparison if CUDA available
-        if self.device == 'cuda' and torch.cuda.is_available():
-            self._compare_gpu_cpu(onnx_path, input_array)
-        
+
+            logger.info("Benchmarking %s …", label)
+            file_size_mb = os.path.getsize(path) / (1024 * 1024)
+
+            try:
+                onnx_time, onnx_output = self.measure_onnx_inference(
+                    path, input_array, num_runs
+                )
+                metrics = self.calculate_metrics(pt_output, onnx_output)
+                results.append(
+                    {
+                        "Model": label,
+                        "File Size (MB)": f"{file_size_mb:.1f}",
+                        "Inference Time (ms)": f"{onnx_time:.2f}",
+                        "MSE": f"{metrics['mse']:.3e}",
+                        "Cosine Similarity": f"{metrics['cosine_similarity']:.4f}",
+                    }
+                )
+            except Exception:
+                logger.exception("Failed to benchmark %s", label)
+
+        # --- Print table ---
+        print("\n=== Model Performance Comparison ===")
+        print(tabulate(results, headers="keys", tablefmt="grid"))
+
+        # --- GPU vs CPU breakdown ---
+        if self._use_cuda:
+            self._compare_gpu_cpu(onnx_path, input_array, num_runs)
+
         return results
-    
-    def _compare_gpu_cpu(self, onnx_path: str, input_array: np.ndarray):
-        """Compare GPU vs CPU inference performance."""
-        print("\n🖥️  GPU vs CPU Comparison")
-        
-        # CPU inference
-        cpu_session = ort.InferenceSession(onnx_path, providers=['CPUExecutionProvider'])
-        input_name = cpu_session.get_inputs()[0].name
-        
-        start = time.time()
-        for _ in range(100):
-            _ = cpu_session.run(None, {input_name: input_array})
-        cpu_time = (time.time() - start) / 100 * 1000
-        
-        # GPU inference
-        if 'CUDAExecutionProvider' in ort.get_available_providers():
-            gpu_session = ort.InferenceSession(onnx_path, providers=['CUDAExecutionProvider'])
-            
-            start = time.time()
-            for _ in range(100):
-                _ = gpu_session.run(None, {input_name: input_array})
-            gpu_time = (time.time() - start) / 100 * 1000
-            
-            speedup = cpu_time / gpu_time
-            
-            print(f"CPU Inference Time: {cpu_time:.1f} ms")
-            print(f"GPU Inference Time: {gpu_time:.1f} ms")
-            print(f"GPU Speedup: {speedup:.2f}x")
-        else:
-            print("GPU not available for comparison")
+
+    def _compare_gpu_cpu(
+        self, onnx_path: str, input_array: np.ndarray, num_runs: int = 100
+    ) -> None:
+        """Log GPU vs CPU throughput comparison for the base ONNX model."""
+        cpu_time, _ = self.measure_onnx_inference(
+            onnx_path, input_array, num_runs, providers=["CPUExecutionProvider"]
+        )
+        if "CUDAExecutionProvider" not in ort.get_available_providers():
+            logger.info("CUDAExecutionProvider not available; skipping GPU comparison.")
+            return
+
+        gpu_time, _ = self.measure_onnx_inference(
+            onnx_path,
+            input_array,
+            num_runs,
+            providers=["CUDAExecutionProvider", "CPUExecutionProvider"],
+        )
+        speedup = cpu_time / gpu_time if gpu_time > 0 else float("inf")
+        logger.info(
+            "GPU vs CPU — CPU: %.2f ms | GPU: %.2f ms | Speedup: %.2fx",
+            cpu_time,
+            gpu_time,
+            speedup,
+        )
+        print(f"\n=== GPU vs CPU ===")
+        print(f"CPU : {cpu_time:.2f} ms")
+        print(f"GPU : {gpu_time:.2f} ms")
+        print(f"Speedup: {speedup:.2f}×")
